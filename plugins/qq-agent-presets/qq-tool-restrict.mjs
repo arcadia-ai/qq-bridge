@@ -182,6 +182,9 @@ export const OPTIONAL_BUNDLE_TOOL_NAMES = Object.freeze([
 ])
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
+  // Not needed for ordinary QQ search; hide broad/long-running remote jobs.
+  'mcp__tavily__tavily_crawl',
+  'mcp__tavily__tavily_map',
   // 本地执行面（见上）
   ...LOCAL_EXECUTION_TOOLS,
   // 按需安装的可选能力包（0.2.1 起默认不存在；装上就要挡）
@@ -223,6 +226,10 @@ const SAFE_PREFIXES = [
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
 const SAFE_EXACT = new Set([
+  // Search and extraction, plus research when warranted; no crawl/map.
+  'mcp__tavily__tavily_search',
+  'mcp__tavily__tavily_research',
+  'mcp__tavily__tavily_extract',
   'ask_user_question',
   'todo_write',
 ])
