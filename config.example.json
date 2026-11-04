@@ -1,4 +1,5 @@
 {
+  "groupMute": { "enabled": false },
   "memo": { "enabled": false },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",

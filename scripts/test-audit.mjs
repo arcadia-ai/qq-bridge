@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tests = [
+  'test-group-mute.mjs',
   // Persistent memos: isolation, date precision, atomic batches and restart safety.
   'test-memo.mjs', 'test-memo-batch.mjs',
   // Local extensions: offline cloud voice, owner/balance ACL and Qzone idempotency.

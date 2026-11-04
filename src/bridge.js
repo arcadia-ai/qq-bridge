@@ -1,3 +1,4 @@
+import { GroupMuteService } from './group-mute.mjs';
 import { MemoStore, parseMemo, memoReply } from './memo-store.mjs';
 import { resolveInstalledPreset, synchronizePreset } from './preset-sync.js';
 import { renderPatch } from '../scripts/build-agent-preset-patches.mjs';
@@ -712,6 +713,7 @@ function loadConfig() {
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
     memo: { enabled: file.memo?.enabled === true },
+    groupMute: { enabled: file.groupMute?.enabled === true },
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
@@ -1494,6 +1496,18 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  let groupMute = null;
+  if (cfg.groupMute?.enabled === true) {
+    try {
+      groupMute = new GroupMuteService({
+        file:path.join(STATE_DIR,'group-mute','actions.sqlite3'),
+        getMember:(group,user)=>bot.getGroupMemberInfo(Number(group),Number(user),{noCache:true}),
+        ban:(group,user,seconds)=>bot.setGroupBan(Number(group),Number(user),seconds),
+        allowed:c=>cfg.groupMute?.enabled === true && (cfg.allow?.groups || []).map(String).includes(c.group)
+          && modeAllowed(`group:${c.group}`,'group',Number(c.group),cfg,currentMode)
+      });
+    } catch(error) { log('群禁言模块初始化失败:',error.message); }
+  }
   // Memo failures must not take the existing chat service down.
   let memo = null;
   if (cfg.memo?.enabled === true) {
@@ -11972,6 +11986,20 @@ async function main() {
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
     const roleState = readRoleState();
+    if (kind === 'group' && cfg.groupMute?.enabled === true) {
+      if (!groupMute) {
+        // No fallback to model-driven moderation when storage is unavailable.
+        const ownText=(Array.isArray(event.message)?event.message:[]).filter(x=>x.type==='text').map(x=>x.data?.text||'').join(' ');
+        if (isOwner && /禁/.test(ownText)) { await sendToQQ(key,'禁言模块未就绪，未执行。'); return; }
+      } else {
+        const moderation=await groupMute.execute(event,{ownerQQ:cfg.ownerQQ,groups:cfg.allow?.groups||[]});
+        if (moderation.handled) {
+          if (!moderation.silent) log('群禁言指令',key,String(event.message_id||''),moderation.state || (moderation.duplicate?'duplicate':'rejected'));
+          if (moderation.reply) await sendToQQ(key,moderation.reply);
+          return;
+        }
+      }
+    }
     // Ignore quote/forward text: only actual text segments in this QQ event are commands.
     const memoText = (Array.isArray(event.message) ? event.message : []).filter(x => x.type === 'text').map(x => x.data?.text || '').join('').trim();
     const memoCommand = parseMemo(memoText);
