@@ -230,6 +230,8 @@ const SAFE_EXACT = new Set([
   'mcp__tavily__tavily_search',
   'mcp__tavily__tavily_research',
   'mcp__tavily__tavily_extract',
+  // Local read-only adapter; never allow the raw remote tool namespace.
+  'mcp__xianyu__xianyu_market_query',
   'ask_user_question',
   'todo_write',
 ])
