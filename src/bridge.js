@@ -15,6 +15,15 @@ import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
+import { createQzonePublisher } from './qzone-lib.js';
+import { createDeepseekBalanceReader } from './deepseek-balance.js';
+import { canReadBalance, isSelfMention } from './balance-access.mjs';
+import { readDshCredential } from './web-search.js';
+import { buildOwnerIdentity, roleRevision } from './owner-identity.mjs';
+import { findVoiceRequest } from './tts-access.mjs';
+import { createTtsService } from './tts-service.mjs';
+import { synthesizeCosyVoice } from './cosyvoice-client.mjs';
+import { normalizeDelivery } from './tts-delivery.mjs';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
@@ -502,7 +511,7 @@ function isSilentMarker(text) {
 
 // DSH MCP 发送类工具：一旦 AI 在回合里调用过这些工具，说明消息已经由工具发出，
 // 桥接应跳过该回合的自动转发，避免“工具发一条 + 自动转发一条”的重复。
-const SEND_TOOL_RE = /^mcp__snowluma__qq_(send_group_message|send_private_message|reply|send_burst|send_message)$/;
+const SEND_TOOL_RE = /^mcp__snowluma__qq_(send_group_message|send_private_message|reply|send_burst|send_message|send_voice|speak)$/;
 function isSendToolName(name) {
   return SEND_TOOL_RE.test(String(name ?? ''));
 }
@@ -678,6 +687,13 @@ function loadConfig() {
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
+    ttsCloud: {
+      enabled: file.ttsCloud?.enabled === true,
+      model: 'cosyvoice-v3.5-flash', voiceId: String(file.ttsCloud?.voiceId ?? ''),
+      rate: file.ttsCloud?.rate ?? 1, monthlyBudgetYuan: file.ttsCloud?.monthlyBudgetYuan ?? 30
+    },
+    qzone: { enabled: file.qzone?.enabled === true },
+    deepseekBalance: { enabled: file.deepseekBalance?.enabled === true, apiKeyRef: file.deepseekBalance?.apiKeyRef || 'DEEPSEEK_API_KEY' },
     allow: {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
@@ -692,6 +708,8 @@ function loadConfig() {
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
+    consoleHost: String(file.consoleHost ?? '127.0.0.1').trim(),
+    consoleTrustedHosts: Array.isArray(file.consoleTrustedHosts) ? file.consoleTrustedHosts.map(value => String(value).trim().toLowerCase()).filter(Boolean) : [],
     consoleToken: file.consoleToken ?? '',
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
@@ -1569,6 +1587,25 @@ async function main() {
     };
   }
 
+  function ttsCfg() {
+    const value = cfg.ttsCloud ?? {};
+    return {
+      enabled: value.enabled === true && voiceCfg().enabled,
+      model: 'cosyvoice-v3.5-flash', voiceId: String(value.voiceId ?? ''),
+      rate: Number(value.rate) > 0 ? Math.max(0.5, Math.min(2, Number(value.rate))) : 1,
+      maxChars: 100, maxSeconds: 30,
+      maxPerMinute: Math.max(1, voiceCfg().maxPerMinute), maxPerHour: Math.max(1, voiceCfg().maxPerHour),
+      pricePer10kYuan: 0.8,
+      monthlyBudgetYuan: Number.isFinite(Number(value.monthlyBudgetYuan)) && Number(value.monthlyBudgetYuan) >= 0 ? Number(value.monthlyBudgetYuan) : 30
+    };
+  }
+
+  function ttsHintV2(key) {
+    if (!ttsCfg().enabled || !v2ToolEnabled('sendVoice')) return '';
+    if (!/^group:\d+$/.test(key) && key !== `private:${cfg.ownerQQ}`) return '';
+    return '【云端短语音】已接入固定女声音色。主人私聊、白名单群中任意群友真实@你并明确要求“用语音回复/发条语音/读出来”时，调用 qq_speak 将你自己的短回复合成并发回本会话；先读最近消息，sourceMessageId取该请求的消息ID或seq。text最多100字，最长30秒；每次结合角色卡、当前对话、已有角色状态和这句话的表达意图，给delivery填写10—30字的语气提示（如“有点委屈又嘴硬，轻声，句尾稍缓”或“开心带笑意，语调轻快但自然”）。日常克制，开心或委屈时适当明显，保持情绪连贯，不一律开心；text只放要说的话，语气提示单独传递。无明确请求时用文字。qq_send_voice只发库内现成录音，新的文字回复请用qq_speak。成功后不必再发一份相同文字；失败按本次工具的实际错误回退文字。同一来源消息发送状态不确定时不重试；用户发来新的明确语音请求时，必须读取新的来源消息ID并实际调用qq_speak，不能直接复述历史报错或把历史失败当成本次结果。不要朗读凭据、路径或代码。\n\n';
+  }
+
   function voiceLibrary() {
     const dir = voiceCfg().dir;
     const files = listAudioFiles(dir);
@@ -1742,11 +1779,14 @@ async function main() {
         volume: audio?.volume ?? vc.defaultVolume,
         normalize: audio?.normalize === true,
         loudness: audio?.loudness ?? vc.loudness,
-        ffmpegPath: vc.ffmpegPath
+        ffmpegPath: vc.ffmpegPath,
+        tmpDir: '/srv/dsh-qq/voice/out/processed'
       });
     } catch (error) {
       throw new Error(`音量处理失败：${error?.message ?? error}`);
     }
+    // 音量处理的产物同样受服务 UMask 影响，供容器 QQ 用户只读。
+    if (processed.converted) fs.chmodSync(processed.path, 0o640);
     const sendPath = processed.path;
 
     const assertSendAllowed = guard ? captureSendGuard(key) : null;
@@ -3118,6 +3158,7 @@ async function main() {
 
   function startConsoleServer() {
     const port = cfg.consolePort ?? 3100;
+    const listenHost = cfg.consoleHost || '127.0.0.1';
     // 控制台鉴权：优先用 config.consoleToken，未配置则自动生成并持久化，不再默认无鉴权。
     // 使用 let 以便控制台内手动修改令牌后热更新。
     const configuredToken = String(cfg.consoleToken ?? '').trim();
@@ -3164,6 +3205,25 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    let qzonePublisher = null;
+    const balanceReader = createDeepseekBalanceReader({
+      getApiKey: () => readDshCredential(cfg.deepseekBalance.apiKeyRef) || process.env[cfg.deepseekBalance.apiKeyRef] || ''
+    });
+    const ttsService = createTtsService({
+      stateFile: path.join(ROOT, 'state', 'tts-ledger.json'),
+      cacheDir: '/srv/dsh-qq/voice/out/tts', getSettings: ttsCfg,
+      getCredentials: () => ({ apiKey: process.env.DASHSCOPE_API_KEY, workspaceId: process.env.DASHSCOPE_WORKSPACE_ID }),
+      synthesize: synthesizeCosyVoice, inspect: inspectAudio, log,
+      send: async (key, file, spoken) => {
+        voiceBudgetCheck(key, voiceCfg());
+        const sent = await sendVoiceV2(key, file, { guard: true, audit: true });
+        voiceBudgetCommit(key);
+        recordVoiceSentV2(key, sent, `[语音] ${spoken}`);
+        const verification = await verifyVoiceMessageSent(sent.messageId);
+        appendActivity(`${key} [tts] 发送短语音 (${sent.detail})`);
+        return { messageId: sent.messageId, verified: verification?.confirmed === true };
+      }
+    });
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -3180,6 +3240,17 @@ async function main() {
         'Referrer-Policy': 'no-referrer'
       };
       const sendJson = (obj, status = 200) => {
+        // 长轮询可在同一回合接收新请求，需随真实消息再次给出工具提示。
+        if (status === 200 && obj?.ok && ['/api/socialV2/recent', '/api/socialV2/unread', '/api/socialV2/wait'].includes(url.pathname)
+          && ttsHintV2(obj.key)) {
+          const latest = (obj.newMessages ?? obj.messages ?? []).findLast(message => message && !message.isSelf);
+          const source = latest && findVoiceRequest({ key: obj.key, ownerQQ: cfg.ownerQQ,
+            sourceMessageId: String(latest.messageId ?? latest.seq ?? ''), messages: socialV2.conversations.get(obj.key)?.recentMessages ?? [] });
+          if (source && !ttsService.requestStatus(obj.key, source.sourceId)) obj = { ...obj, cloudVoice: {
+            enabled: true, sourceMessageId: source.sourceId,
+            hint: '这是当前尚未处理的新语音请求，请用这个sourceMessageId实际调用qq_speak，并根据当前角色心情填写delivery语气提示。历史报错不是本次结果；以本次调用结果为准。成功后不重复发送相同文字。'
+          } };
+        }
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS });
         res.end(JSON.stringify(obj, null, 2));
       };
@@ -3245,23 +3316,19 @@ async function main() {
         res.end();
         return;
       }
-      // Host 头校验（DNS rebinding 硬化）：控制台只监听 127.0.0.1，因此合法请求的 Host
-      // 只可能是 127.0.0.1 / localhost / [::1] 加本端口。攻击者用一个 TTL=0 的域名解析到
-      // 127.0.0.1 时，浏览器会把 evil.com:3100 当作同源，Origin 校验随之失效；卡住 Host
-      // 这一层后，这类请求在进入任何业务分支之前就被拒掉。
-      // 反代/端口转发场景会被一并拒绝——这是有意的（要远程访问请用 SSH 隧道并自行承担）。
+      // 全接口监听与访问Host分开配置，允许明确的局域网入口并继续防范DNS rebinding。
       const hostHeader = String(req.headers.host ?? '');
       // 用**实际绑定端口**而不是配置值：测试夹具用 consolePort: 0 让系统分配端口，
       // 配置里那个 0 不是请求里的 Host 端口。请求必然发生在 listen 之后，所以这里拿得到。
       const boundPort = server.address()?.port ?? port;
-      const allowedHosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`];
+      const allowedHosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`, ...cfg.consoleTrustedHosts];
       if (!allowedHosts.includes(hostHeader.toLowerCase())) {
-        sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受本机回环访问` }, 403);
+        sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受配置的可信Host` }, 403);
         return;
       }
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
       // 定长比较：`!==` 会在第一个不同的字符处短路，理论上可被本机进程用响应时延逐字节试探。
-      // 令牌是 192 bit 随机值且只监听回环，所以这是纵深防御而非在野漏洞。
+      // 使用定长比较，回环与局域网访问沿用同一控制台令牌。
       const suppliedToken = String(url.searchParams.get('token') ?? req.headers['x-console-token'] ?? '');
       const tokenMatches = (() => {
         if (!consoleToken) return false; // 上面已拒绝空令牌；真出现也只许失败关闭，绝不 return true
@@ -3315,7 +3382,7 @@ async function main() {
           }
         }
       }
-      // CSRF 防护：所有写操作必须是 application/json，且（若带 Origin）必须来自本机页面。
+      // CSRF 防护：所有写操作必须是 application/json，且（若带 Origin）必须与请求入口同源。
       // 默认未配 consoleToken 时，这可阻止任意网页用表单/跨站请求触发
       // /api/restart、/api/workspace/reset、/api/role 等破坏性接口。
       if (req.method !== 'GET') {
@@ -3326,9 +3393,12 @@ async function main() {
         }
         const origin = req.headers['origin'];
         if (origin) {
-          let originHost = '';
-          try { originHost = new URL(String(origin)).host; } catch {}
-          if (![`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(originHost)) {
+          let sameOrigin = false;
+          try {
+            const source = new URL(String(origin));
+            sameOrigin = source.protocol === 'http:' && source.host.toLowerCase() === hostHeader.toLowerCase();
+          } catch {}
+          if (!sameOrigin) {
             sendJson({ ok: false, error: '跨站请求被拒绝' }, 403);
             return;
           }
@@ -4354,7 +4424,7 @@ async function main() {
           }
           const isV2 = currentMode === 'reserved2';
           const roleState = readRoleState();
-          const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+          const roleLine = roleContextLineV2(roleState);
           // 二代必须带会话令牌，否则 AI 调用任何 MCP 状态/发送工具都会被拒。
           let tokenLine = '';
           if (isV2) {
@@ -4694,6 +4764,9 @@ async function main() {
           for (const [flag, name] of Object.entries(toolMap)) {
             if (tools[flag] !== false && !(stickerToolFlags.has(flag) && !stickerEnabled())) enabledTools.push(name);
           }
+          if (qzoneHintV2(key)) enabledTools.push('qq_publish_qzone');
+          if (balanceHintV2(key)) enabledTools.push('qq_get_deepseek_balance');
+          if (ttsHintV2(key)) enabledTools.push('qq_speak');
           sendJson({
             ok: true,
             key,
@@ -4704,7 +4777,8 @@ async function main() {
               userId: selfUserId || null,
               line: selfIdentityTextV2().trim() || null
             },
-            role: { name: roleState.role ?? null, hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() },
+            role: { name: roleState.role ?? null, revision: roleRevision(roleState.role, currentRoleHintV2()), hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() },
+            ownerIdentity: ownerIdentityV2(key),
             recommended: cfg.socialV2?.provideRecommendations === false ? null : {
               wake: cfg.socialV2?.wake ?? {},
               send: cfg.socialV2?.send ?? {},
@@ -4712,6 +4786,9 @@ async function main() {
               proactive: cfg.socialV2?.proactive ?? {}
             },
             enabledTools,
+            qzone: { enabled: Boolean(qzoneHintV2(key)), hint: qzoneHintV2(key) },
+            deepseekBalance: { enabled: Boolean(balanceHintV2(key)), hint: balanceHintV2(key) },
+            cloudVoice: { enabled: Boolean(ttsHintV2(key)), hint: ttsHintV2(key), maxChars: 100, maxSeconds: 30, expressive: true },
             replyTiming: replyTimingV2(st),
             unreadCount: st.unread.length,
             recentCount: st.recentMessages.length,
@@ -4739,6 +4816,54 @@ async function main() {
               hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             }
           });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/deepseek-balance') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!cfg.deepseekBalance?.enabled || currentMode !== 'reserved2' || !cfg.ownerQQ
+            || !agentTokenOk(key, req.headers['x-agent-token']) || !v2SessionAllowed(key)
+            || !canReadBalance({ key, ownerQQ: cfg.ownerQQ, sourceMessageId: url.searchParams.get('sourceMessageId'),
+              messages: socialV2.conversations.get(key)?.recentMessages ?? [] })) {
+            sendJson({ ok: false, error: '仅主人私聊，或主人在白名单群中最新的真实@余额请求可查询；群聊请读取最近消息取得sourceMessageId，超过5分钟或有新发言请主人重新@查询' }, 403);
+            return;
+          }
+          try { sendJson({ ok: true, ...await balanceReader.read() }); }
+          catch (error) { sendJson({ ok: false, error: error.message }, error.statusCode || 502); }
+          return;
+        }
+        // 主人私聊发表说说；独立持久化发布记录，避免网络重试重复发帖。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/publish-qzone') {
+          try {
+            if (!qzonePublisher) qzonePublisher = createQzonePublisher({
+              stateFile: path.join(STATE_DIR, 'qzone-publish.json'),
+              authorize(key, token) {
+                if (!cfg.qzone?.enabled) throw Object.assign(new Error('说说功能未开启'), { statusCode: 403 });
+                if (currentMode !== 'reserved2' || !cfg.ownerQQ || key !== `private:${cfg.ownerQQ}`
+                  || !agentTokenOk(key, token) || !v2SessionAllowed(key)) {
+                  throw Object.assign(new Error('仅主人私聊的有效会话可以发表说说'), { statusCode: 403 });
+                }
+              },
+              resolveSource(key, messageId) {
+                const recent = socialV2.conversations.get(key)?.recentMessages ?? [];
+                const source = recent.find(m => !m.isSelf && m.isOwner && String(m.userId) === String(cfg.ownerQQ)
+                  && (String(m.messageId ?? '') === messageId || String(m.seq ?? '') === messageId));
+                if (!source) throw Object.assign(new Error('找不到这条主人私聊指令，请先读取最近消息取得消息ID'), { statusCode: 400 });
+                return String(source.messageId ?? source.seq);
+              },
+              audit(content) {
+                const secrets = [...KNOWN_AGENT_TOKENS, cfg.consoleToken, cfg.snowluma?.accessToken, cfg.dsh?.authToken].filter(Boolean);
+                if (SENSITIVE_RE.test(content) || secrets.some(secret => content.includes(secret))) {
+                  throw Object.assign(new Error('说说正文包含敏感信息，请调整正文'), { statusCode: 403 });
+                }
+              },
+              send: async params => (await onebotHttpAction('send_qzone_msg', params, { timeoutMs: 45000 })).data,
+              log
+            });
+            const result = await qzonePublisher.publish(await readBody(), req.headers['x-agent-token']);
+            sendJson(result);
+          } catch (error) {
+            sendJson({ ok: false, error: error.statusCode ? error.message : '说说发布记录或服务异常，请检查服务日志' }, error.statusCode || 503);
+          }
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/unread') {
@@ -5661,6 +5786,50 @@ async function main() {
         }
 
         // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/speak') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? '').trim();
+          const sourceMessageId = String(body.sourceMessageId ?? '').trim();
+          const authorize = reference => {
+            if (!ttsCfg().enabled || currentMode !== 'reserved2' || !v2ToolEnabled('sendVoice')
+              || !agentTokenOk(key, token) || !v2SessionAllowed(key) || shouldBlockSilentReply(key)) return null;
+            return findVoiceRequest({ key, ownerQQ: cfg.ownerQQ, sourceMessageId: reference,
+              messages: socialV2.conversations.get(key)?.recentMessages ?? [] });
+          };
+          try {
+            if (!authorize(sourceMessageId)) {
+              sendJson({ ok: false, error: '仅主人私聊或白名单群内真实@的明确语音请求可使用；请提供本会话5分钟内来源消息ID' }, 403);
+              return;
+            }
+            const spoken = String(body.text ?? '').trim();
+            const audit = text => {
+              const secrets = [process.env.DASHSCOPE_API_KEY, ...KNOWN_AGENT_TOKENS, cfg.consoleToken,
+                cfg.snowluma?.accessToken, cfg.dsh?.authToken, readDshCredential(cfg.deepseekBalance?.apiKeyRef)].filter(Boolean);
+              if (SENSITIVE_RE.test(text) || /(?:\/srv\/|sk-[A-Za-z0-9_-]{16,})/.test(text)
+                || secrets.some(secret => String(secret).length >= 8 && text.includes(secret))) {
+                throw Object.assign(new Error('这段文字包含路径或凭据信息，请改用普通短句'), { statusCode: 403 });
+              }
+            };
+            if (!spoken || Array.from(spoken).length > 100 || /[<>\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(spoken)) {
+              sendJson({ ok: false, error: '短语音需要1—100字普通文本，长回复请改用文字' }, 400); return;
+            }
+            const delivery = normalizeDelivery(body.delivery);
+            audit(spoken);
+            audit(delivery);
+            voiceBudgetCheck(key, voiceCfg());
+            if (body.dryRun === true) {
+              sendJson({ ok: true, dryRun: true, checks: ['permission', 'source', 'length', 'delivery', 'audit'], delivery, maxChars: 100, maxSeconds: 30 });
+              return;
+            }
+            sendJson(await ttsService.say({ key, sourceMessageId, text: spoken, delivery, authorize, audit }));
+          } catch (error) {
+            log(`[tts] ${key} request failed (${Number(error.statusCode) || 502})`);
+            sendJson({ ok: false, error: error.statusCode ? error.message : '短语音处理失败，请改用文字回复' }, error.statusCode || 502);
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-voice') {
           const body = await readBody();
           const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
@@ -7184,8 +7353,8 @@ async function main() {
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
     });
-    server.listen(port, '127.0.0.1', () => {
-      log(`本地控制台已启动：http://127.0.0.1:${port}`);
+    server.listen(port, listenHost, () => {
+      log(`控制台已启动：http://${listenHost}:${port}`);
     });
     // 端口被占用说明已有实例在跑：以 exit 2 退出，守护脚本会识别为"已有实例"而不是无限重启
     server.on('error', (error) => {
@@ -9554,6 +9723,17 @@ async function main() {
     return `第 ${bad.join('，')} 条之间像是把同一句话拆开了；如果两条拼起来才完整，请合并成一条，或把断点移到完整句子的边界。`;
   }
 
+  function ownerIdentityV2(key) {
+    return buildOwnerIdentity({ key, ownerQQ: cfg.ownerQQ, roleText: currentRoleHintV2(),
+      messages: socialV2.conversations.get(key)?.recentMessages ?? [] });
+  }
+
+  function roleContextLineV2(roleState = readRoleState()) {
+    if (!roleState.role) return '';
+    const revision = roleRevision(roleState.role, currentRoleHintV2());
+    return `【当前角色】${roleState.role}，角色卡版本 ${revision}。若与此前读取的版本不同，回复前先调用 qq_get_prompt 读取最新完整角色卡，以最新版本为准。\n\n`;
+  }
+
   function currentRoleHintV2() {
     // 先按 〔二代〕/〔一代〕 标记筛小节；下面的逐行过滤只是给「没标记的老卡片」兜底。
     const raw = roleHintForMode('v2');
@@ -9793,7 +9973,7 @@ async function main() {
   }
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
-  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
+  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = [], atSelf = false) {
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
@@ -9838,6 +10018,7 @@ async function main() {
       text: truncateText(String(textContent), 200),
       plain: truncateText(String(plainContent ?? textContent), 200),
       tail: truncateTextTail(String(plainContent ?? textContent), 200),
+      atSelf: atSelf === true,
       quoteTargetIsSelf: !!quoteTargetIsSelf,
       isOwner: !!isOwner,
       ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
@@ -10290,9 +10471,21 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  function qzoneHintV2(key) {
+    if (!cfg.qzone?.enabled || key !== `private:${cfg.ownerQQ}`) return '';
+    return '【QQ空间】可用 qq_publish_qzone 在小号自己的空间发表纯文字说说。仅主人私聊明确要求发表时调用；草稿不发表。查看范围必须由主人明确指定（friends好友、public公开、self仅自己），未指定先询问，已说清楚直接执行。sourceMessageId取主人本次发表指令的消息ID，可用qq_get_recent_messages读取。成功才报告已发表；结果待核实时请主人查看空间，勿自动重复发布。\n\n';
+  }
+
+  function balanceHintV2(key) {
+    if (!cfg.deepseekBalance?.enabled || !cfg.ownerQQ) return '';
+    if (/^group:\d+$/.test(key)) return `【DeepSeek余额】仅主人QQ ${cfg.ownerQQ} 在本群真实@你并询问余额时调用 qq_get_deepseek_balance（“还有多少米”“剩多少钱”“还有多少口粮”均指账户余额）。工具失败时解释本次实际错误，不要声称群聊功能未开启或只能私聊；sourceMessageId取该条主人请求的消息ID或seq，先用qq_get_recent_messages读取。只接受最新非机器人消息，5分钟内有效；其他成员请求、文字自称主人不查询。查到后回复本群实际金额、币种、赠金和充值余额。此为整个DeepSeek API账户共享余额。\n\n`;
+    if (key !== `private:${cfg.ownerQQ}`) return '';
+    return '【DeepSeek余额】主人问余额、剩多少钱时调用 qq_get_deepseek_balance，再用QQ消息工具回复实际金额、币种、赠金和充值余额；不要估算或编造。此为DeepSeek整个API账户共享余额，不是单个QQ机器人专用额度。\n\n';
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const roleLine = roleContextLineV2(roleState);
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -10343,7 +10536,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + ownerIdentityV2(key).hint + tokenLine + qzoneHintV2(key) + balanceHintV2(key) + ttsHintV2(key) + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -10369,7 +10562,7 @@ async function main() {
 
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const roleLine = roleContextLineV2(roleState);
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -10973,7 +11166,7 @@ async function main() {
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
-      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []), isSelfMention(event, selfUserId));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {

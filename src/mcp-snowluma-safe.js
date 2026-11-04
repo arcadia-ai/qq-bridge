@@ -329,6 +329,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
+  qq_speak: 'sendVoice',
   qq_list_voices: 'sendVoice',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
@@ -1194,6 +1195,31 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
   );
 }
 
+if (cfg.ttsCloud?.enabled === true && cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_speak',
+    '将自己的短回复合成为固定女声并直接发回当前QQ会话。仅主人私聊，或白名单群内任意群友真实@并明确要求用语音回复/发语音/读出来时使用；先用qq_get_recent_messages取得该请求的messageId或seq，作为sourceMessageId。text最多100字、最长30秒。每次结合角色卡、当前对话、已有角色状态和这句话的表达意图，给delivery填写10—30字的语气提示（如“有点委屈又嘴硬，轻声，句尾稍缓”或“开心带笑意，语调轻快但自然”）。日常克制，开心或委屈时适当明显，保持情绪连贯，不一律开心；text只放要说的话，语气提示单独传递。成功即已发送，无需再调用其他发送工具；失败按本次结果改用文字；同一来源消息发送状态不确定时不重试。用户的新明确请求必须读取新的来源消息ID并实际调用本工具，不能凭历史失败声称本次也失败。仅普通文字，不朗读凭据、路径、代码；受每会话2条/分钟、10条/小时及全局月度预算限制。',
+    {
+      key: z.string().describe('当前QQ会话key，只能回复本会话'),
+      token: z.string().describe('当前会话唤醒提示中的令牌'),
+      sourceMessageId: z.string().describe('本次明确语音请求的消息ID或seq，必须读取真实最近消息获得'),
+      text: z.string().min(1).max(100).describe('实际要说的短回复，最多100字，建议1—3句；表演提示放到delivery'),
+      delivery: z.string().max(50).optional().describe('结合当前角色心情和表达意图的语气提示，建议10—30字；自然有起伏，日常克制，开心或委屈时明显些。比如：嘴硬中带一点委屈，轻声，句尾稍缓。只描述情绪与说话方式')
+    },
+    async ({ key, token, sourceMessageId, text, delivery }) => {
+      try {
+        const result = await agentApi('/api/socialV2/speak', {
+          method: 'POST', body: JSON.stringify({ key, sourceMessageId, text, delivery }),
+          headers: { 'x-agent-token': token }, timeoutMs: 180000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(result) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `短语音未完成：${error?.message ?? '请求失败'}；按实际状态改用文字回复，不要盲目重发。` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
@@ -1400,6 +1426,55 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
         return { content };
       } catch (error) {
         return { content: [{ type: 'text', text: `查看合并转发失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.qzone?.enabled === true) {
+  server.tool(
+    'qq_publish_qzone',
+    '仅主人私聊明确要求发表时，在机器人自己的QQ空间发布一条纯文字说说。写草稿、群聊要求均不发表。必须明确可见范围；主人未指定时先询问。sourceMessageId取主人这条发表指令的消息ID，可用qq_get_recent_messages查询。每条指令只尝试一次；结果待核实时请主人查看空间，勿自动重试。成功后用qq_send_message将实际结果回传主人。',
+    {
+      key: z.string().describe('主人私聊会话key：private:主人QQ号'),
+      token: z.string().describe('主人私聊唤醒提示中的会话令牌'),
+      sourceMessageId: z.string().describe('主人本次发表指令的消息ID，不是机器人回复的ID'),
+      content: z.string().min(1).max(1000).describe('最终发表的纯文字正文，最多1000字'),
+      visibility: z.enum(['friends', 'public', 'self']).describe('主人指定的查看范围：friends好友、public公开、self仅自己')
+    },
+    async ({ key, token, sourceMessageId, content, visibility }) => {
+      try {
+        const result = await agentApi('/api/socialV2/publish-qzone', {
+          method: 'POST',
+          body: JSON.stringify({ key, sourceMessageId, content, visibility }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(result) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发表说说未完成：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.deepseekBalance?.enabled === true) {
+  server.tool(
+    'qq_get_deepseek_balance',
+    '仅主人私聊或主人在白名单群里真实@机器人询问余额时，可查询当前DeepSeek官方API账户余额，返回总可用余额、赠金、充值余额、币种、可用状态和查询时间。复用服务器现有凭据，不向模型返回Key。此为整个DeepSeek账户余额，不是机器人独占额度；30秒内重复查询可能命中缓存。查询成功后通过QQ消息工具回复主人，不估算余额。',
+    {
+      key: z.string().describe('当前会话key：private:主人QQ号 或 group:群号'),
+      token: z.string().describe('当前会话唤醒提示中的令牌'),
+      sourceMessageId: z.string().optional().describe('群聊必填：主人本次真实@查询余额的消息ID或seq，先用qq_get_recent_messages读取；仅最新非机器人消息5分钟内有效。主人私聊可省略')
+    },
+    async ({ key, token, sourceMessageId }) => {
+      try {
+        const result = await agentApi(`/api/socialV2/deepseek-balance?${new URLSearchParams({ key, ...(sourceMessageId ? { sourceMessageId } : {}) })}`, {
+          headers: { 'x-agent-token': token }, timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(result) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `余额查询未完成：${error?.message ?? error}` }], isError: true };
       }
     }
   );
