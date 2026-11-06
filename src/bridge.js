@@ -6,6 +6,7 @@ import { createTransferSender } from './transfer-onebot.mjs';
 import { createTransferApi } from './transfer-api.mjs';
 import { MemoStore, parseMemo, memoReply } from './memo-store.mjs';
 import { contextCommand, ContextMemoService, extractDeepseek } from './context-memo.mjs';
+import { summaryIntent, GroupSummaryService, summaryModel } from './group-summary.mjs';
 import { resolveInstalledPreset, synchronizePreset } from './preset-sync.js';
 import { renderPatch } from '../scripts/build-agent-preset-patches.mjs';
 // QQ ↔ DeepSeek Harness 桥接主程序。
@@ -719,6 +720,7 @@ function loadConfig() {
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
     memo: { enabled: file.memo?.enabled === true, contextEnabled: file.memo?.contextEnabled === true },
+    groupSummary: { enabled: file.groupSummary?.enabled === true },
     groupMute: { enabled: file.groupMute?.enabled === true },
     groupAtAll: { enabled: file.groupAtAll?.enabled === true },
     fileTransfer: { enabled: file.fileTransfer?.enabled === true,
@@ -1581,6 +1583,20 @@ async function main() {
         if(!Array.isArray(d.message)||d.message.some(x=>!['text','at'].includes(x.type)))return null;
         return {...m,text:d.message.filter(x=>x.type==='text').map(x=>x.data?.text||'').join(''),time:Number(d.time)*1000};
       }}); }catch(error){log('上下文备忘初始化失败:',error.name);}
+  }
+  let groupSummary=null;
+  const summaryAllowed=group=>cfg.groupSummary?.enabled===true && (cfg.allow?.groups||[]).map(String).includes(String(group))
+    && allowed('group',group,cfg) && isSessionAllowedInCurrentMode(`group:${group}`)
+    && !(currentMode==='reserved2' && (socialV2.paused || shouldBlockSilentReply(`group:${group}`)));
+  if(cfg.groupSummary?.enabled){
+    try{groupSummary=new GroupSummaryService({file:path.join(STATE_DIR,'group-summary','history.sqlite3'),allowed:summaryAllowed,selfQQ:()=>selfUserId,
+      call:async(action,params)=>{
+        const base=String(cfg.snowluma.httpUrl).replace(/\/+$/,'');
+        const r=await fetch(`${base}/${action}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${cfg.snowluma.accessToken}`},
+          body:JSON.stringify(params),signal:AbortSignal.timeout(5000)});
+        const d=await r.json();if(!r.ok||d.status!=='ok'||d.retcode!==0)throw Error('总结群记录读取暂不可用。');return d.data;
+      },model:(system,input,json)=>summaryModel(system,input,{json,key:readDshCredential(cfg.deepseekBalance.apiKeyRef)||process.env[cfg.deepseekBalance.apiKeyRef]||'',model:cfg.dsh.model})});
+    }catch(error){log('群聊总结初始化失败:',error.name);}
   }
   function memoContext(key, actor) {
     const [kind, id] = String(key).split(':');
@@ -12129,6 +12145,26 @@ async function main() {
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
     const roleState = readRoleState();
+    if(kind==='group' && cfg.groupSummary?.enabled){
+      try{groupSummary?.ingest(event);}catch(error){log('群聊记录缓存失败:',error.name);}
+      const request=(Array.isArray(event.message)?event.message:[]).filter(s=>s.type==='text').map(s=>s.data?.text||'').join('').trim();
+      if(isSelfMention(event,selfUserId) && summaryIntent(request)){
+        try{
+          if(!groupSummary)throw Error('总结模块未就绪，请联系主人。');
+          if(!summaryAllowed(String(event.group_id)))throw Error('总结当前群会话不可用。');
+          if(request.length>1000 || event.message.some(s=>!['text','at'].includes(s.type)))throw Error('总结请直接艾特并发送明确文字指令，不带转发或引用。');
+          const result=await groupSummary.run(event,request);
+          if(!result.duplicate){
+            if(!summaryAllowed(String(event.group_id)))throw Error('总结群权限已变化。');
+            groupSummary.dispatch(event.group_id,event.message_id);
+            await sendToQQ(key,result.text);
+            if(lastSendSucceeded(key))groupSummary.delivered(event.group_id,event.message_id);
+            log('群聊总结完成',key,String(event.message_id));
+          }
+        }catch(error){log('群聊总结失败',key,error.name);await sendToQQ(key,/^总结/.test(error.message)?error.message:'总结暂未完成，请稍后重新发送明确请求。');}
+        return;
+      }
+    }
     if (kind==='group' && cfg.groupAtAll?.enabled===true) {
       const atAllConfig={ownerQQ:cfg.ownerQQ,groups:cfg.allow?.groups||[]};
       // Narrow trusted inbound command only; never expose @all through general MCP/text send.
@@ -12588,6 +12624,7 @@ async function main() {
     const canonical = canonicalV2Key(key);
     const messageId = event?.message_id != null ? String(event.message_id) : '';
     if (!canonical || !messageId) return false;
+    if(type==='group_recall' && groupSummary)groupSummary.recall(groupId,messageId);
     const st = socialV2.conversations.get(canonical);
     if (!st) return false;
 
