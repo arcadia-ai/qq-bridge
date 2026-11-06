@@ -1,4 +1,5 @@
 import { GroupMuteService } from './group-mute.mjs';
+import { GroupAtAllService, parseGroupAtAll } from './group-at-all.mjs';
 import { captureTransferSource, findTransferRequest, transferCancelled } from './transfer-access.mjs';
 import { createTransferService } from './transfer-service.mjs';
 import { createTransferSender } from './transfer-onebot.mjs';
@@ -718,6 +719,7 @@ function loadConfig() {
   const cfg = {
     memo: { enabled: file.memo?.enabled === true },
     groupMute: { enabled: file.groupMute?.enabled === true },
+    groupAtAll: { enabled: file.groupAtAll?.enabled === true },
     fileTransfer: { enabled: file.fileTransfer?.enabled === true,
       maxBytes: Number(file.fileTransfer?.maxBytes ?? 500000000),
       maxImageBytes: Number(file.fileTransfer?.maxImageBytes ?? 20000000),
@@ -1521,6 +1523,36 @@ async function main() {
           && modeAllowed(`group:${c.group}`,'group',Number(c.group),cfg,currentMode)
       });
     } catch(error) { log('群禁言模块初始化失败:',error.message); }
+  }
+  let groupAtAll = null;
+  if (cfg.groupAtAll?.enabled === true) {
+    const atAllAllowed=c=>cfg.groupAtAll?.enabled === true && String(cfg.ownerQQ)===c.actor
+      && (cfg.allow?.groups||[]).map(String).includes(c.group) && allowed('group',c.group,cfg)
+      && isSessionAllowedInCurrentMode(`group:${c.group}`)
+      && !(currentMode==='reserved2' && (socialV2.paused || shouldBlockSilentReply(`group:${c.group}`)));
+    const atAllCall=async(action,params,signal)=>{
+      const base=String(cfg.snowluma?.httpUrl||'http://127.0.0.1:3000').replace(/\/+$/,'');
+      const response=await fetch(`${base}/${action}`,{method:'POST',headers:{'content-type':'application/json',
+        ...(cfg.snowluma?.accessToken?{authorization:`Bearer ${cfg.snowluma.accessToken}`}:{})},
+        body:JSON.stringify(params),signal:signal||AbortSignal.timeout(10000)});
+      const body=await response.json();
+      if(!response.ok||body.status!=='ok'||body.retcode!==0)throw Error('群艾特全体接口未确认');
+      return body.data;
+    };
+    try {
+      groupAtAll=new GroupAtAllService({file:path.join(STATE_DIR,'group-at-all','actions.sqlite3'),
+        allowed:atAllAllowed,getMember:(group,user)=>bot.getGroupMemberInfo(Number(group),Number(user),{noCache:true}),
+        getQuota:group=>atAllCall('get_group_at_all_remain',{group_id:Number(group)}),
+        send:(c,signal)=>{
+          const key=`group:${c.group}`;
+          const next=sendChainFor(key).then(async()=>{
+            if(signal.aborted||!atAllAllowed(c)||Date.now()>c.expiresAt)throw Error('艾特全体指令已失效');
+            const result=await atAllCall('send_group_msg',{group_id:Number(c.group),message:[{type:'at',data:{qq:'all'}}]},signal);
+            recordSentMessagesV2(key,['@全体成员']);return result;
+          });
+          rememberSendChain(key,next.then(()=>{},()=>{}));return next;
+        }});
+    }catch(error){log('群艾特全体模块初始化失败:',error.name);}
   }
   // Memo failures must not take the existing chat service down.
   let memo = null;
@@ -12075,6 +12107,18 @@ async function main() {
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
     const roleState = readRoleState();
+    if (kind==='group' && cfg.groupAtAll?.enabled===true) {
+      const atAllConfig={ownerQQ:cfg.ownerQQ,groups:cfg.allow?.groups||[]};
+      // Narrow trusted inbound command only; never expose @all through general MCP/text send.
+      const candidate=parseGroupAtAll(event,atAllConfig);
+      if(candidate.handled){
+        const result=groupAtAll?await groupAtAll.execute(event,atAllConfig):
+          (candidate.silent?candidate:{handled:true,reply:candidate.reply||'艾特全体模块未就绪，未执行。'});
+        if(!result.silent)log('群艾特全体指令',key,String(event.message_id||''),result.state||(result.duplicate?'duplicate':'rejected'));
+        if(result.reply)await sendToQQ(key,result.reply);
+        return;
+      }
+    }
     if (kind === 'group' && cfg.groupMute?.enabled === true) {
       if (!groupMute) {
         // No fallback to model-driven moderation when storage is unavailable.

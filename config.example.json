@@ -1,5 +1,6 @@
 {
   "groupMute": { "enabled": false },
+  "groupAtAll": { "enabled": false },
   "fileTransfer": {
     "enabled": false,
     "maxBytes": 500000000,
