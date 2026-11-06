@@ -1,5 +1,15 @@
 {
   "groupMute": { "enabled": false },
+  "fileTransfer": {
+    "enabled": false,
+    "maxBytes": 500000000,
+    "maxImageBytes": 20000000,
+    "cacheBytes": 2000000000,
+    "retentionMs": 86400000,
+    "maxPerUserHour": 3,
+    "maxPerGroupHour": 8,
+    "maxQueue": 8
+  },
   "memo": { "enabled": false },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",

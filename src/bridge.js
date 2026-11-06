@@ -1,4 +1,8 @@
 import { GroupMuteService } from './group-mute.mjs';
+import { captureTransferSource, findTransferRequest, transferCancelled } from './transfer-access.mjs';
+import { createTransferService } from './transfer-service.mjs';
+import { createTransferSender } from './transfer-onebot.mjs';
+import { createTransferApi } from './transfer-api.mjs';
 import { MemoStore, parseMemo, memoReply } from './memo-store.mjs';
 import { resolveInstalledPreset, synchronizePreset } from './preset-sync.js';
 import { renderPatch } from '../scripts/build-agent-preset-patches.mjs';
@@ -714,6 +718,14 @@ function loadConfig() {
   const cfg = {
     memo: { enabled: file.memo?.enabled === true },
     groupMute: { enabled: file.groupMute?.enabled === true },
+    fileTransfer: { enabled: file.fileTransfer?.enabled === true,
+      maxBytes: Number(file.fileTransfer?.maxBytes ?? 500000000),
+      maxImageBytes: Number(file.fileTransfer?.maxImageBytes ?? 20000000),
+      cacheBytes: Number(file.fileTransfer?.cacheBytes ?? 2000000000),
+      retentionMs: Number(file.fileTransfer?.retentionMs ?? 86400000),
+      maxPerUserHour: Number(file.fileTransfer?.maxPerUserHour ?? 3),
+      maxPerGroupHour: Number(file.fileTransfer?.maxPerGroupHour ?? 8),
+      maxQueue: Number(file.fileTransfer?.maxQueue ?? 8), sharedGid: 1000 },
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
@@ -1496,6 +1508,8 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  let transferService = null;
+  const transferSources = new Map();
   let groupMute = null;
   if (cfg.groupMute?.enabled === true) {
     try {
@@ -1728,6 +1742,11 @@ async function main() {
       pricePer10kYuan: 0.8,
       monthlyBudgetYuan: Number.isFinite(Number(value.monthlyBudgetYuan)) && Number(value.monthlyBudgetYuan) >= 0 ? Number(value.monthlyBudgetYuan) : 30
     };
+  }
+
+  function transferHintV2(key) {
+    if (!cfg.fileTransfer?.enabled || !/^group:[1-9]\d*$/.test(key)) return '';
+    return '【图片/文件交付】本群已支持 qq_fetch_and_send：用户真实@明确要求找图/下载文件并发群时，先用Tavily确认官网或官方Release的公开直链，再用本群最近消息的messageId提交。安装包必须先问清系统和架构，不因服务器是Linux就下Linux版，不擅自假定Windows x64；可用同一人的真实@补充回复确认后提交。一次请求一个资源，只回当前群，绝不执行安装包。kind=image发图片，kind=file发安装包/文档；提供普通filename、软件title、platform、version与不带凭据的官方sourceUrl，绝不传本机路径/登录Cookie/任意请求头。file最大500MB、image最大20MB。queued表示后台受理，不是已发送；只需说任务已受理，完成后自动交付，不重复调用上传或再发同一文件。用qq_transfer_status查询本群任务。出现权限/下载/校验/发送不明时按实际结果说明，不复述历史失败。\n\n';
   }
 
   function ttsHintV2(key) {
@@ -3765,6 +3784,57 @@ async function main() {
         return { messageId: sent.messageId, verified: verification?.confirmed === true };
       }
     });
+    let transferApi = null;
+    if (cfg.fileTransfer?.enabled === true) {
+      const transfersAllowed = (key,job={}) => currentMode === 'reserved2' && cfg.socialV2?.enabled !== false && !socialV2.paused
+        && cfg.fileTransfer?.enabled === true && /^group:[1-9]\d*$/.test(key)
+        && v2SessionAllowed(key) && !shouldBlockSilentReply(key)
+        && !transferCancelled(transferSources.get(key)||[],job);
+      const transferAudit = value => {
+        const raw=String(value||'');
+        const secrets=[consoleToken,...KNOWN_AGENT_TOKENS,cfg.snowluma?.accessToken,cfg.dsh?.authToken,
+          process.env.DASHSCOPE_API_KEY,readDshCredential(cfg.deepseekBalance?.apiKeyRef)].filter(Boolean);
+        if (SENSITIVE_RE.test(raw)||secrets.some(s=>String(s).length>=8&&raw.includes(String(s)))) {
+          throw Object.assign(new Error('文件说明或地址包含路径/凭据信息，未处理'),{statusCode:403});
+        }
+      };
+      const nativeSender=createTransferSender({ selfQQ:()=>selfUserId,
+        call:async(action,params,write=false)=>{
+          const base=String(cfg.snowluma?.httpUrl||'http://127.0.0.1:3000').replace(/\/+$/,'');
+          const response=await fetch(`${base}/${action}`,{method:'POST',headers:{'content-type':'application/json',
+            ...(cfg.snowluma?.accessToken?{authorization:`Bearer ${cfg.snowluma.accessToken}`}:{})},
+            body:JSON.stringify(params),signal:AbortSignal.timeout(write?900000:15000)});
+          const result=await response.json();
+          if (!response.ok||result.status!=='ok'||result.retcode!==0)throw new Error('QQ文件动作未确认');
+          return result.data;
+        }});
+      try {
+        transferService=createTransferService({file:path.join(STATE_DIR,'transfers','jobs.sqlite3'),
+          cacheDir:path.resolve(ROOT,'../transfers/out'),getSettings:()=>cfg.fileTransfer,
+          authorize:input=>findTransferRequest({key:input.key,sourceMessageId:input.sourceMessageId,kind:input.kind,
+            messages:transferSources.get(input.key)||[]}),canSend:transfersAllowed,audit:transferAudit,log,
+          send:async job=>{
+            const guard=captureSendGuard(job.key,{ai:true});
+            const next=sendChainFor(job.key).then(async()=>{
+              guard();if(!transfersAllowed(job.key,job))throw new Error('文件请求已撤销或权限变化');
+              assertOutboundAuditOk(job.key,`${job.filename} ${job.title}`);
+              const sent=await nativeSender(job);
+              recordSentMessagesV2(job.key,[`[${job.kind==='image'?'图片':'文件'}] ${job.filename} ${sent.verified?'已确认':'回执待确认'}`]);
+              appendActivity(`${job.key} [transfer] ${job.id} ${sent.verified?'verified':'unverified'}`);
+              return sent;
+            });
+            rememberSendChain(job.key,next.then(()=>{},()=>{}));return next;
+          },
+          notify:async(key,content)=>{
+            assertOutboundAuditOk(key,content);
+            const sent=await sendMessagesV2(key,[content],[],null);
+            recordSentMessagesV2(key,sent);return sent.length===1;
+          }
+        });
+      } catch(error) { log('[transfer] 文件模块初始化失败，暂停交付:',error.name); }
+      transferApi=createTransferApi({enabled:()=>cfg.fileTransfer?.enabled===true,
+        tokenOk:agentTokenOk,sessionAllowed:key=>transfersAllowed(key),getService:()=>transferService});
+    }
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -3800,6 +3870,8 @@ async function main() {
             hint: '这是当前尚未处理的新语音请求，请用这个sourceMessageId实际调用qq_speak，并根据当前角色心情填写delivery语气提示。历史报错不是本次结果；以本次调用结果为准。成功后不重复发送相同文字。'
           } };
         }
+        if (status === 200 && obj?.ok && ['/api/socialV2/recent','/api/socialV2/unread','/api/socialV2/wait'].includes(url.pathname)
+          && transferHintV2(obj.key)) obj={...obj,fileTransfer:{enabled:true,hint:transferHintV2(obj.key)}};
         if (status === 200 && obj?.ok && ['/api/socialV2/recent','/api/socialV2/unread','/api/socialV2/wait'].includes(url.pathname)) {
           const hint = memoHint(obj.key);
           if (hint) obj = {...obj, longTermMemo: hint};
@@ -5340,6 +5412,7 @@ async function main() {
           if (qzoneHintV2(key)) enabledTools.push('qq_publish_qzone');
           if (balanceHintV2(key)) enabledTools.push('qq_get_deepseek_balance');
           if (ttsHintV2(key)) enabledTools.push('qq_speak');
+          if (transferHintV2(key)) enabledTools.push('qq_fetch_and_send','qq_transfer_status');
           sendJson({
             ok: true,
             key,
@@ -5362,6 +5435,7 @@ async function main() {
             qzone: { enabled: Boolean(qzoneHintV2(key)), hint: qzoneHintV2(key) },
             deepseekBalance: { enabled: Boolean(balanceHintV2(key)), hint: balanceHintV2(key) },
             cloudVoice: { enabled: Boolean(ttsHintV2(key)), hint: ttsHintV2(key), maxChars: 100, maxSeconds: 30, expressive: true },
+            fileTransfer: { enabled: Boolean(transferHintV2(key)), hint: transferHintV2(key) },
             replyTiming: replyTimingV2(st),
             unreadCount: st.unread.length,
             recentCount: st.recentMessages.length,
@@ -6381,6 +6455,21 @@ async function main() {
         }
 
         // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
+        if ((req.method === 'POST' && url.pathname === '/api/socialV2/transfer')
+          || (req.method === 'GET' && url.pathname === '/api/socialV2/transfer-status')) {
+          try {
+            if (!transferApi) { sendJson({ok:false,error:'文件交付功能未启用'},403);return; }
+            const token=String(req.headers['x-agent-token']||'');
+            const result=req.method==='POST'?transferApi.submit(await readBody(),token):
+              transferApi.status(String(url.searchParams.get('key')||''),token,String(url.searchParams.get('jobId')||''));
+            sendJson(result);
+          } catch(error) {
+            log('[transfer] API请求失败',Number(error.statusCode)||502);
+            sendJson({ok:false,error:error.statusCode?error.message:'文件交付请求失败，请联系主人'},error.statusCode||502,{safeError:true});
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/speak') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -11456,7 +11545,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = memoHint(key) + roleLine + identityLine + ownerIdentityV2(key).hint + tokenLine + qzoneHintV2(key) + balanceHintV2(key) + ttsHintV2(key) + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = memoHint(key) + roleLine + identityLine + ownerIdentityV2(key).hint + tokenLine + qzoneHintV2(key) + balanceHintV2(key) + ttsHintV2(key) + transferHintV2(key) + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12153,6 +12242,14 @@ async function main() {
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      if (kind==='group' && cfg.fileTransfer?.enabled) {
+        const source=captureTransferSource(event);
+        if (source) {
+          const records=(transferSources.get(key)||[]).filter(m=>Date.now()-m.time<=15*60_000);
+          if(!records.some(m=>m.messageId===source.messageId))records.push(source);
+          transferSources.set(key,records.slice(-200));
+        }
+      }
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []), isSelfMention(event, selfUserId));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);

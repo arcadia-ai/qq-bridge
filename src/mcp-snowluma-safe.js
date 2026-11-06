@@ -1352,6 +1352,29 @@ if (cfg.ttsCloud?.enabled === true && cfg.socialV2?.voice?.enabled !== false && 
   );
 }
 
+// This tool accepts a background job, not a completed QQ send; do not mark queued as sent.
+if (cfg.fileTransfer?.enabled === true) {
+  server.tool('qq_fetch_and_send',
+    '将官网/官方Release公开直链下载并后台交付到当前群。只用于本群真实@的明确找图、下载文件/安装包并发送请求。先读最近消息，sourceMessageId取真实messageId（不是seq）；可取同一人的@平台补充回复ID。安装包先确认用户的系统和架构，不擅自假定；提供platform如Windows x64。每条请求一个资源。kind=image为图片消息，file为群文件。不接受本机路径/Cookie/请求头，不执行安装包。queued仅已受理，不是已发送；完成后后端自动交付，不要重复调用其他发送工具。同一来源不自动重试，失败根据本次状态说明。',
+    {key:z.string(),token:z.string().min(1),sourceMessageId:z.string().min(1),kind:z.enum(['image','file']),
+      url:z.string().max(2048).describe('已确认的公开文件直链，不是下载介绍页'),
+      sourceUrl:z.string().max(2048).describe('官网或官方Release来源页，无登录凭据'),
+      filename:z.string().min(1).max(160).describe('普通文件名含正确扩展名，不是路径'),
+      title:z.string().min(1).max(100),platform:z.string().max(60).optional(),version:z.string().max(60).optional(),
+      expectedSha256:z.string().regex(/^[a-fA-F0-9]{64}$/).optional().describe('仅在取得可靠校验值时填写，禁止编造')},
+    async({key,token,...body})=>{
+      try{return {content:[{type:'text',text:serializeModelData(await agentApi('/api/socialV2/transfer',{
+        method:'POST',headers:{'x-agent-token':token},body:JSON.stringify({key,...body}),timeoutMs:20000}))}]};}
+      catch(error){return {isError:true,content:[{type:'text',text:`资源任务未受理：${error.message}；不要声称已发送。`}]};}
+    });
+  server.tool('qq_transfer_status','查询当前群图片/文件任务状态；只查本群jobId。queued/downloading/sending不是已送达，send_unknown不自动重发。',
+    {key:z.string(),token:z.string().min(1),jobId:z.string().regex(/^tr_[a-f0-9]{32}$/)},
+    async({key,token,jobId})=>{
+      try{return {content:[{type:'text',text:serializeModelData(await agentApi(`/api/socialV2/transfer-status?${new URLSearchParams({key,jobId})}`,{headers:{'x-agent-token':token}}))}]};}
+      catch(error){return {isError:true,content:[{type:'text',text:`任务查询未完成：${error.message}`}]};}
+    });
+}
+
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
