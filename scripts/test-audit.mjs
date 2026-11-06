@@ -7,6 +7,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const tests = [
   'test-group-mute.mjs',
   'test-group-at-all.mjs',
+  'test-context-memo.mjs',
   // Queued image/file delivery: all fixtures, no real QQ writes.
   'test-transfers.mjs',
   // Persistent memos: isolation, date precision, atomic batches and restart safety.

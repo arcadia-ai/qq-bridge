@@ -11,7 +11,7 @@
     "maxPerGroupHour": 8,
     "maxQueue": 8
   },
-  "memo": { "enabled": false },
+  "memo": { "enabled": false, "contextEnabled": false },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",
     "provider": "deepseek-official",

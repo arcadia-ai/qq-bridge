@@ -5,6 +5,7 @@ import { createTransferService } from './transfer-service.mjs';
 import { createTransferSender } from './transfer-onebot.mjs';
 import { createTransferApi } from './transfer-api.mjs';
 import { MemoStore, parseMemo, memoReply } from './memo-store.mjs';
+import { contextCommand, ContextMemoService, extractDeepseek } from './context-memo.mjs';
 import { resolveInstalledPreset, synchronizePreset } from './preset-sync.js';
 import { renderPatch } from '../scripts/build-agent-preset-patches.mjs';
 // QQ ↔ DeepSeek Harness 桥接主程序。
@@ -717,7 +718,7 @@ function loadConfig() {
   const file = readJsonSafe(p, null, true);
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
-    memo: { enabled: file.memo?.enabled === true },
+    memo: { enabled: file.memo?.enabled === true, contextEnabled: file.memo?.contextEnabled === true },
     groupMute: { enabled: file.groupMute?.enabled === true },
     groupAtAll: { enabled: file.groupAtAll?.enabled === true },
     fileTransfer: { enabled: file.fileTransfer?.enabled === true,
@@ -1559,6 +1560,27 @@ async function main() {
   if (cfg.memo?.enabled === true) {
     try { memo = new MemoStore(path.join(ROOT, 'state', 'memo', 'memos.sqlite3')); }
     catch (error) { log('备忘模块初始化失败:', error.message); }
+  }
+  let contextMemo=null;
+  const memoFullSources=new Map();
+  if(memo && cfg.memo.contextEnabled){
+    try { contextMemo=new ContextMemoService({memo,
+      allowed:ctx=>cfg.memo.enabled && cfg.memo.contextEnabled && isSessionAllowedInCurrentMode(ctx.scope)
+        && !(currentMode==='reserved2' && socialV2.paused),
+      extract:messages=>extractDeepseek(messages,{key:readDshCredential(cfg.deepseekBalance.apiKeyRef)||process.env[cfg.deepseekBalance.apiKeyRef]||'',model:cfg.dsh.model}),
+      resolve:async(m,ctx)=>{
+        const cached=(memoFullSources.get(ctx.scope)||[]).find(x=>x.messageId===m.messageId);
+        if(cached)return cached;
+        const base=String(cfg.snowluma.httpUrl).replace(/\/+$/,'');
+        const response=await fetch(`${base}/get_msg`,{method:'POST',headers:{'content-type':'application/json',
+          authorization:`Bearer ${cfg.snowluma.accessToken}`},body:JSON.stringify({message_id:Number(m.messageId)}),signal:AbortSignal.timeout(3000)});
+        const result=await response.json(),d=result.data;
+        if(!response.ok||result.status!=='ok'||result.retcode!==0||String(d?.message_id)!==m.messageId||String(d?.user_id??d?.sender?.user_id)!==ctx.actor)return null;
+        const [kind,id]=ctx.scope.split(':');
+        if(kind==='group' ? String(d.group_id)!==id : d.message_type!=='private')return null;
+        if(!Array.isArray(d.message)||d.message.some(x=>!['text','at'].includes(x.type)))return null;
+        return {...m,text:d.message.filter(x=>x.type==='text').map(x=>x.data?.text||'').join(''),time:Number(d.time)*1000};
+      }}); }catch(error){log('上下文备忘初始化失败:',error.name);}
   }
   function memoContext(key, actor) {
     const [kind, id] = String(key).split(':');
@@ -12135,6 +12157,34 @@ async function main() {
     }
     // Ignore quote/forward text: only actual text segments in this QQ event are commands.
     const memoText = (Array.isArray(event.message) ? event.message : []).filter(x => x.type === 'text').map(x => x.data?.text || '').join('').trim();
+    if(cfg.memo?.enabled && cfg.memo.contextEnabled){
+      const at=Number(event.time)*1000,source=String(event.message_id??'');
+      const records=(memoFullSources.get(key)||[]).filter(m=>Date.now()-m.time<=1200000);
+      if(/^-?[1-9]\d*$/.test(source) && Number.isFinite(at) && Date.now()-at<=1200000 && at-Date.now()<=60000
+        && Array.isArray(event.message) && event.message.every(x=>['text','at'].includes(x.type)) && memoText.length<=2000
+        && !records.some(m=>m.messageId===source)) records.push({messageId:source,userId:String(event.user_id),text:memoText,time:at});
+      memoFullSources.set(key,records.slice(-100));
+      const request=contextCommand(memoText);
+      if(request && (kind==='private'||isSelfMention(event,selfUserId))){
+        try{
+          if(!contextMemo)throw Error('上下文备忘模块未就绪。');
+          if(!/^-?[1-9]\d*$/.test(source)||!Number.isFinite(at)||Date.now()-at>300000||at-Date.now()>60000)throw Error('备忘指令已过期或来源缺失，请发新指令。');
+          if(event.message.some(x=>!['text','at'].includes(x.type)))throw Error('请直接艾特并发送备忘指令，不使用转发或引用作为指令。');
+          const ctx=memoContext(key,event.user_id);
+          const history=[...(socialV2.conversations.get(key)?.recentMessages||[])];
+          for(const m of records){const i=history.findIndex(x=>x.messageId===m.messageId);if(i>=0)history[i]=m;else history.push(m);}
+          const result=await contextMemo.handle(ctx,source,request,history,at);
+          if(result.duplicate||(result.replayed&&result.delivered))return;
+          await sendToQQ(key,result.text||memoReply(result,key));
+          if(result.committed&&lastSendSucceeded(key))memo.delivered(ctx,source);
+          log('上下文备忘',key,result.item?.id||'',result.committed?'saved':'draft-or-query');
+        }catch(error){
+          log('上下文备忘失败',key,error.name);
+          await sendToQQ(key,/^备忘|^仅创建者|^上下文|^请直接/.test(error.message)?error.message:'备忘提取暂未完成，请稍后发新指令，或直接写明正文；未将客套话保存。');
+        }
+        return;
+      }
+    }
     const memoCommand = parseMemo(memoText);
     if (cfg.memo?.enabled === true && memoCommand) {
       let reply;
